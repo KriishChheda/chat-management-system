@@ -2,8 +2,9 @@
 // we create the schema followed by the model of that schema.
 
 const mongoose = require('mongoose');
-  // Define the "Model" (The blueprint for a message)
+
 const messageSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   chatId: { type: String, required: true }, // Every messsage belongs to a particular chat
   text: { type: String, required: true },
   isUser: { type: Boolean, required: true },
