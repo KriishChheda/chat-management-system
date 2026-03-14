@@ -151,7 +151,7 @@ const handleClearHistory = async () => {
         setCurrentChatId(id);
         setSidebarOpen(false); // Close sidebar on mobile after selection
       }}
-      chatList={allChats}
+        chatList={allChats}
         currentChatId={currentChatId}
       />
 
