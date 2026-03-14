@@ -19,10 +19,9 @@ function App() {
   return (
     <Router>
       <Routes>
-        {/* Landing Page Route */}
-        <Route 
+       <Route 
           path="/" 
-          element={!token ? <LandingPage onLogin={handleLogin} /> : <Navigate to="/chat" />} 
+          element={!token ? <LandingPage onLogin={handleLogin} token={token} /> : <Navigate to="/chat" />} 
         />
 
         {/* Protected Chatbot Route */}
