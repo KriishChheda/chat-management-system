@@ -404,48 +404,121 @@ useEffect(() => {
   loadChatHistory();
 }, [currentChatId,token]); 
 
+// const handleSendMessage = async (e) => {
+//   if (e) e.preventDefault();
+//   if (!inputValue.trim() && selectedFiles.length === 0) return;
+
+//   const tempUserMsg = {
+//     id: Date.now(),
+//     text: inputValue || (selectedFiles.length > 0 ? `Sent ${selectedFiles.length} files` : ""),
+//     isUser: true,
+//     timestamp: new Date(),
+//   };
+
+//   setMessages((prev) => [...prev, tempUserMsg]);
+//   const messageToSend = inputValue; 
+  
+//   setInputValue('');
+//   setSelectedFiles([]); 
+//   setIsTyping(true);
+
+//   try {
+//     const response = await fetch('http://localhost:5002/api/chat', {
+//       method: 'POST',
+//       headers: { 'Content-Type': 'application/json',
+//                   'Authorization': `Bearer ${token}`
+//        },
+//       body: JSON.stringify({ 
+//         message: messageToSend, 
+//         chatId: currentChatId  
+//       }),
+//     });
+
+//     const data = await response.json();
+
+//     const botMessage = {
+//       id: Date.now() + 1,
+//       text: data.reply,
+//       isUser: false,
+//       timestamp: new Date(),
+//     };
+    
+//     setMessages((prev) => [...prev, botMessage]);
+//   } catch (error) {
+//     console.error('Error:', error);
+//   } finally {
+//     setIsTyping(false);
+//   }
+// };
+
 const handleSendMessage = async (e) => {
   if (e) e.preventDefault();
   if (!inputValue.trim() && selectedFiles.length === 0) return;
 
+  const messageText = inputValue;
+  const filesToUpload = [...selectedFiles];
+
+  // 1. Show User Message in UI immediately
   const tempUserMsg = {
     id: Date.now(),
-    text: inputValue || (selectedFiles.length > 0 ? `Sent ${selectedFiles.length} files` : ""),
+    text: messageText || (filesToUpload.length > 0 ? `Uploaded ${filesToUpload.length} file(s)` : ""),
     isUser: true,
     timestamp: new Date(),
   };
 
   setMessages((prev) => [...prev, tempUserMsg]);
-  const messageToSend = inputValue; 
-  
   setInputValue('');
   setSelectedFiles([]); 
   setIsTyping(true);
 
   try {
+    // 2. Handle File Uploads first (if any)
+    if (filesToUpload.length > 0) {
+      for (const file of filesToUpload) {
+        const formData = new FormData();
+        formData.append('file', file);
+        
+        await fetch('http://localhost:5002/api/upload-doc', {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${token}` },
+          body: formData, // No Content-Type header needed; fetch sets it for FormData
+        });
+      }
+    }
+
+    // 3. Send the Chat Prompt
     const response = await fetch('http://localhost:5002/api/chat', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json',
-                  'Authorization': `Bearer ${token}`
-       },
+      headers: { 
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`
+      },
       body: JSON.stringify({ 
-        message: messageToSend, 
+        text: messageText || "Please analyze the uploaded documents.", // 'text' matches your controller
         chatId: currentChatId  
       }),
     });
 
     const data = await response.json();
 
+    // 4. Show AI Response (with citations)
     const botMessage = {
       id: Date.now() + 1,
       text: data.reply,
       isUser: false,
+      citations: data.citations || [], // New field for RAG sources
       timestamp: new Date(),
     };
     
     setMessages((prev) => [...prev, botMessage]);
   } catch (error) {
-    console.error('Error:', error);
+    console.error('Error during RAG operation:', error);
+    setMessages((prev) => [...prev, {
+      id: Date.now() + 2,
+      text: "Sorry, I had trouble reaching the RAG server.",
+      isUser: false,
+      timestamp: new Date(),
+    }]);
   } finally {
     setIsTyping(false);
   }
