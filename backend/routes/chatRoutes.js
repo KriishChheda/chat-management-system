@@ -4,27 +4,32 @@ const chatController = require('../controllers/chatController');
 const auth = require('../middleware/auth');
 const multer = require('multer');
 
-// Configure Multer to store files in memory temporarily 
-// so we can forward them to the Python server (port 5003)
+// Store files in memory so we can forward them to the RAG server (port 5003)
 const upload = multer({ storage: multer.memoryStorage() });
 
-// Public routes
+// --- Public routes ---
 router.post('/signup', chatController.signup);
 router.post('/login', chatController.login);
 
-// Protected routes (Require 'auth' middleware)
-router.get('/messages/:chatId', auth, chatController.getMessagesByChatId);
-router.post('/chat', auth, chatController.sendMessage);
+// --- Protected routes (require JWT via 'auth' middleware) ---
+
+// Create a new chat (registers chat on RAG server + gets back a chatId)
+router.post('/new-chat', auth, chatController.createChat);
+
+// Get list of all chatIds for the logged-in user
 router.get('/chat-list', auth, chatController.getChatList);
 
-// --- NEW RAG ROUTE ---
-// Use 'upload.single("file")' to process the file from the frontend request
+// Get message history for a specific chat
+router.get('/messages/:chatId', auth, chatController.getMessagesByChatId);
+
+// Send a message (proxied to RAG server for LLM + vector search)
+router.post('/chat', auth, chatController.sendMessage);
+
+// Upload a document to a specific chat's vector DB
+// 'chatId' is sent as a form field alongside the file
 router.post('/upload-doc', auth, upload.single('file'), chatController.uploadDocument);
+
+// Delete a chat (removes from MongoDB + RAG vector DB)
 router.delete('/chat/:chatId', auth, chatController.deleteChat);
+
 module.exports = router;
-
-// you define all the routes and return the router object at the end to our server.js file, which will use these routes to handle incoming requests. Each route is linked to a specific controller function that contains the logic for that route.
-
-// we import the controllers which have the logic to handle the requests.
-
-

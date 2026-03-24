@@ -1,26 +1,54 @@
-// Add this right after your imports in chatController.js
 const Message = require('../models/Message');
 const User = require('../models/User');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
 const axios = require('axios');
 const FormData = require('form-data');
 
-console.log("DEBUG: API Key length is:", process.env.GEMINI_API_KEY ? process.env.GEMINI_API_KEY.length : "0 (MISSING)");
+const RAG_SERVER_URL = process.env.RAG_SERVER_URL || 'http://localhost:5003';
 
-// Initialize the Gemini API
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY); // here we craeted an object that defines the connection between Gemini and Node.js. We will use this object to send requests to Gemini and get responses back.
-const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash"});
+// ─── Helper: register a user in the RAG server's DB, return RAG userId ───────
+// Called ONCE during signup. Uses @ragchat.com (a real TLD, passes Pydantic EmailStr).
+async function createRagUser(username) {
+  const ragEmail = `${username.replace(/[^a-zA-Z0-9]/g, '_')}@ragchat.com`;
+  try {
+    const res = await axios.post(`${RAG_SERVER_URL}/api/users`, {
+      email: ragEmail,
+      user_type: 'USER',
+    });
+    console.log(`[RAG] Created RAG user for "${username}" (${ragEmail}) → ${res.data.user_id}`);
+    return res.data.user_id;
+  } catch (err) {
+    if (err.response?.status === 409) {
+      // Already exists — look up by email
+      try {
+        const getRes = await axios.get(`${RAG_SERVER_URL}/api/users/email/${encodeURIComponent(ragEmail)}`);
+        return getRes.data.user._id;
+      } catch (getErr) {
+        console.error('[RAG] Lookup failed after 409:', getErr.message);
+      }
+    }
+    console.error('[RAG] createRagUser failed:', err.response?.data || err.message);
+    return null;
+  }
+}
 
-
-// --- AUTH LOGIC ---
+// ─── AUTH ─────────────────────────────────────────────────────────────────────
 exports.signup = async (req, res) => {
   try {
     const hashedPassword = await bcrypt.hash(req.body.password, 10);
-    const user = await User.create({ username: req.body.username, password: hashedPassword });
-    // this statement here will create an error and throw it back to the catch block if the user with the same username already exists because of the unique constraint we set in the User model.
-    res.status(201).json({ message: "User created" });
+
+    // Register user in RAG server FIRST to get the ragUserId
+    const ragUserId = await createRagUser(req.body.username);
+
+    // Save user in our MongoDB with the ragUserId
+    await User.create({
+      username: req.body.username,
+      password: hashedPassword,
+      ragUserId: ragUserId || null,
+    });
+
+    res.status(201).json({ message: "User created. Please log in." });
   } catch (error) {
     res.status(500).json({ error: "User already exists or server error" });
   }
@@ -32,25 +60,63 @@ exports.login = async (req, res) => {
     if (!user || !(await bcrypt.compare(req.body.password, user.password))) {
       return res.status(401).json({ message: "Auth failed" });
     }
-    const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET || 'your_secret_key', { expiresIn: "1h" });
-    res.json({ token, userId: user._id });
+
+    // If somehow ragUserId is missing (e.g., user created before this feature),
+    // try to create/fetch it now and persist it.
+    let ragUserId = user.ragUserId;
+    if (!ragUserId) {
+      ragUserId = await createRagUser(req.body.username);
+      if (ragUserId) {
+        await User.findByIdAndUpdate(user._id, { ragUserId });
+      }
+    }
+
+    const token = jwt.sign(
+      { userId: user._id, ragUserId },
+      process.env.JWT_SECRET || 'your_secret_key',
+      { expiresIn: "24h" }
+    );
+
+    res.json({ token, userId: user._id, ragUserId });
   } catch (error) {
+    console.error('Login error:', error);
     res.status(500).json({ error: "Login error" });
   }
 };
 
-exports.getMessagesByChatId = async (req, res) => {
+// ─── CHAT CRUD ────────────────────────────────────────────────────────────────
+
+/**
+ * Creates a new chat on the RAG server (which sets up a per-chat vector DB).
+ * Uses the ragUserId from the auth token to satisfy the RAG server's user check.
+ */
+exports.createChat = async (req, res) => {
   try {
-    const messages = await Message.find({ chatId: req.params.chatId, userId: req.userData.userId }).sort({ timestamp: 1 });
-    res.json(messages);
+    const ragUserId = req.userData.ragUserId;
+    const title = req.body.title || `Chat ${new Date().toLocaleString()}`;
+
+    if (!ragUserId) {
+      return res.status(400).json({ error: "RAG user ID not found in token. Please log in again." });
+    }
+
+    const ragResponse = await axios.post(`${RAG_SERVER_URL}/api/chats`, {
+      userId: ragUserId,
+      title,
+    });
+
+    const chatId = ragResponse.data.chat_id;
+    res.status(201).json({ chatId, title });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    console.error("Create Chat Error:", error.response?.data || error.message);
+    res.status(500).json({ error: "Failed to create chat on RAG server" });
   }
 };
 
+/**
+ * Returns all unique chatIds for the logged-in user (from MongoDB message history).
+ */
 exports.getChatList = async (req, res) => {
   try {
-    // Finds unique chatId values in the Message collection
     const chatIds = await Message.find({ userId: req.userData.userId }).distinct("chatId");
     res.json(chatIds);
   } catch (error) {
@@ -58,167 +124,127 @@ exports.getChatList = async (req, res) => {
   }
 };
 
-// Delete a specific chat
-exports.deleteChat = async (req, res) => {
+/**
+ * Returns all messages for a specific chatId (full conversation history).
+ */
+exports.getMessagesByChatId = async (req, res) => {
   try {
-    const { chatId } = req.params;
-    await Message.deleteMany({ chatId });
-    res.json({ message: "Chat deleted successfully" });
+    const messages = await Message.find({
+      chatId: req.params.chatId,
+      userId: req.userData.userId,
+    }).sort({ timestamp: 1 });
+    res.json(messages);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 };
 
-// Logic to send a new message
-// exports.sendMessage = async (req, res) => {
-//   try {
-//     const { message, chatId } = req.body;
-//     const userId = req.userData.userId;
-//     // 1. Fetch existing history for this specific chatId from your DB
-//     const history = await Message.find({ chatId, userId }).sort({ timestamp: 1 });
-
-//     // 2. Format history for Gemini (it expects 'user' and 'model' roles)
-//     const formattedHistory = history.map(msg => ({ role: msg.isUser ? "user" : "model", parts: [{ text: msg.text }] }));
-
-//     // 3. Start a chat session with the loaded his tory
-//     const chatSession = model.startChat({ history: formattedHistory });
-
-//     // 4. Save the NEW user message to your DB
-//     await Message.create({ text: message, isUser: true, chatId, userId });
-
-//     // 5. Send the new message through the session
-//     const result = await chatSession.sendMessage(message);
-//     const botReply = result.response.text();
-
-//     // 6. Save the AI response to your DB
-// await Message.create({ text: botReply, isUser: false, chatId, userId });
-
-//     res.json({ reply: botReply });
-//   } catch (error) {
-//     console.error("Chat Error:", error);
-//     res.status(500).json({ error: "Failed to process chat" });
-//   }
-// };
-
-// exports.sendMessage = async (req, res) => {
-//   const { text, chatId } = req.body;
-//   const userId = req.user.id;
-
-//   try {
-//     // 1. Save User Message to your MongoDB
-//     const userMsg = new Message({ userId, chatId, text, isUser: true });
-//     await userMsg.save();
-
-//     // 2. Call the RAG Server on Port 5003
-//     const ragResponse = await axios.post('http://localhost:5003/api/chats/chat', {
-//       user_id: userId,
-//       conversation_id: chatId,
-//       prompt: text,
-//       collection_name: "default_collection" // Your friend's server uses this to find docs
-//     });
-
-//     const { answer, citations } = ragResponse.data;
-
-//     // 3. Save AI Response (with citations) to your MongoDB
-//     const aiMsg = new Message({
-//       userId,
-//       chatId,
-//       text: answer,
-//       isUser: false,
-//       citations: citations // Store the sources found by RAG
-//     });
-//     await aiMsg.save();
-
-//     res.status(200).json(aiMsg);
-//   } catch (error) {
-//     console.error("RAG Integration Error:", error);
-//     res.status(500).json({ error: "Failed to get response from RAG server" });
-//   }
-// };
-
-// --- RAG INTEGRATION LOGIC ---
-
-// 1. Sending a message to the RAG server
-
+/**
+ * Sends user's message to the RAG server for processing, saves both the
+ * user message and the AI reply (with citations) to MongoDB.
+ */
 exports.sendMessage = async (req, res) => {
-  // 1. Destructure 'message' because that's what your frontend sends in body
-  const { message, chatId } = req.body;
-  const userId = req.userData.userId; // Matches your auth.js middleware
-
   try {
-    // 2. Save User Message to your MongoDB
-    const userMsg = new Message({ 
-      userId, 
-      chatId, 
-      text: message, // Save the prompt
-      isUser: true 
-    });
-    await userMsg.save();
+    const { message, chatId } = req.body;
+    const userId = req.userData.userId;
+    const ragUserId = req.userData.ragUserId;
 
-    // 3. Call the RAG Server on Port 5003
-    // We wrap this in a specific try-catch to see if the Python server is the problem
-    let ragResponse;
-    try {
-      ragResponse = await axios.post('http://localhost:5003/api/chats/chat', {
-        user_id: userId.toString(),
-        conversation_id: chatId,
-        prompt: message,
-        collection_name: "default_collection" 
-      });
-    } catch (ragErr) {
-      console.error("Python RAG Server Error:", ragErr.message);
-      return res.status(503).json({ error: "RAG Server on 5003 is offline or crashed." });
+    if (!message || !chatId) {
+      return res.status(400).json({ error: "message and chatId are required" });
     }
 
-    const { answer, citations } = ragResponse.data;
+    // 1. Save user message to MongoDB immediately
+    await Message.create({ text: message, isUser: true, chatId, userId });
 
-    // 4. Save AI Response (with citations) to your MongoDB
-    const aiMsg = new Message({
-      userId,
-      chatId,
-      text: answer,
-      isUser: false,
-      citations: citations || []
-    });
-    await aiMsg.save();
+    // 2. Forward to RAG server
+    let ragData;
+    try {
+      const ragResponse = await axios.post(
+        `${RAG_SERVER_URL}/api/chats/${chatId}/prompt`,
+        { prompt: message, userId: ragUserId }
+      );
+      ragData = ragResponse.data;
+    } catch (ragErr) {
+      console.error("RAG Server Error:", ragErr.response?.data || ragErr.message);
+      return res.status(503).json({
+        error: "RAG server is unavailable. Make sure it's running on port 5003."
+      });
+    }
 
-    // 5. Send back what the frontend expects
-    res.status(200).json({ 
-      reply: answer, 
-      citations: aiMsg.citations 
-    });
+    const botReply = ragData.response || "I couldn't generate a response.";
+    const rawCitations = ragData.citations || [];
+
+    // Normalize citations: RAG returns objects {citationId, source, text, page, link}
+    // but our Message schema stores citations as [String]. Extract the source filename.
+    const citationStrings = rawCitations.map(c =>
+      typeof c === 'string' ? c : (c.source || c.citationId || JSON.stringify(c))
+    );
+
+    // 3. Save AI reply to MongoDB
+    await Message.create({ text: botReply, isUser: false, chatId, userId, citations: citationStrings });
+
+    // 4. Return to frontend — send the full objects so UI can show rich citations
+    res.json({ reply: botReply, citations: rawCitations });
   } catch (error) {
-    console.error("General Chat Error:", error);
-    res.status(500).json({ error: "Internal Server Error" });
+    console.error("Send Message Error:", error);
+    res.status(500).json({ error: "Failed to process chat" });
   }
 };
 
-
-// 2. Uploading a document to the RAG server
+/**
+ * Forwards a file to the chat-specific RAG endpoint.
+ * The RAG server chunks, embeds, and stores it in that chat's ChromaDB collection.
+ */
 exports.uploadDocument = async (req, res) => {
   try {
     if (!req.file) {
-      return res.status(400).json({ error: 'No file provided' });
+      return res.status(400).json({ error: "No file provided" });
+    }
+    const chatId = req.body.chatId;
+    if (!chatId) {
+      return res.status(400).json({ error: "chatId is required alongside the file" });
     }
 
-    const userId = req.userData.userId;
-
-    // Create a Form to send the file to Python
     const formData = new FormData();
-    formData.append('file', req.file.buffer, req.file.originalname);
-    formData.append('user_id', userId.toString());
-
-    // Forward to RAG server
-    const response = await axios.post('http://localhost:5003/api/docs/upload', formData, {
-      headers: { ...formData.getHeaders() }
+    formData.append('file', req.file.buffer, {
+      filename: req.file.originalname,
+      contentType: req.file.mimetype,
     });
+
+    const response = await axios.post(
+      `${RAG_SERVER_URL}/api/chats/${chatId}/upload`,
+      formData,
+      { headers: { ...formData.getHeaders() } }
+    );
 
     res.status(200).json({
-      message: "Document successfully uploaded and processed",
-      data: response.data
+      message: "Document uploaded and processed by RAG server",
+      data: response.data,
     });
   } catch (error) {
-    console.error("RAG Upload Error:", error.message);
+    console.error("RAG Upload Error:", error.response?.data || error.message);
     res.status(500).json({ error: "Failed to upload document to RAG server" });
+  }
+};
+
+/**
+ * Deletes all MongoDB messages for this chat and cleans up the RAG vector DB.
+ */
+exports.deleteChat = async (req, res) => {
+  try {
+    const { chatId } = req.params;
+
+    await Message.deleteMany({ chatId });
+
+    // Best-effort cleanup of RAG vector DB (non-fatal if it fails)
+    try {
+      await axios.delete(`${RAG_SERVER_URL}/api/chats/${chatId}`);
+    } catch (ragErr) {
+      console.warn("RAG chat delete (non-fatal):", ragErr.message);
+    }
+
+    res.json({ message: "Chat deleted successfully" });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 };

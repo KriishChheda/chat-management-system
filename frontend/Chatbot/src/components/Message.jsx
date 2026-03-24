@@ -46,14 +46,20 @@ const Message = ({ message, isUser }) => {
               </span>
             </div>
             <div className="flex flex-wrap gap-2">
-              {citations.map((source, index) => (
-                <span 
-                  key={index} 
-                  className="text-[10px] px-2 py-0.5 rounded-md bg-green-500/10 border border-green-500/30 text-green-400"
-                >
-                  {source}
-                </span>
-              ))}
+              {citations.map((source, index) => {
+                // RAG server returns citation objects; extract readable label
+                const label = typeof source === 'string'
+                  ? source
+                  : (source.source || source.citationId || 'Source');
+                return (
+                  <span
+                    key={index}
+                    className="text-[10px] px-2 py-0.5 rounded-md bg-green-500/10 border border-green-500/30 text-green-400"
+                  >
+                    {label}
+                  </span>
+                );
+              })}
             </div>
           </div>
         )}
