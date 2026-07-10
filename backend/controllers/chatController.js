@@ -50,6 +50,7 @@ exports.signup = async (req, res) => {
 
     res.status(201).json({ message: "User created. Please log in." });
   } catch (error) {
+    console.error('Signup error:', error);
     res.status(500).json({ error: "User already exists or server error" });
   }
 };
